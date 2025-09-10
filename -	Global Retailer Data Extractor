@@ -1,0 +1,104 @@
+
+import pandas as pd
+from pyspark.sql import SparkSession#RDD API & Dataframe API((high-level, SQL-like) → Works with structured tabular data.)
+from pyspark.sql.functions import col#col is to represent a column name and lit is for string values telling spark hey it is not column it is string
+
+# -------------------------------------------------------------------------
+# 2. CONFIGURATION INPUTS – can be parameterized for CLI/GUI later
+# -------------------------------------------------------------------------
+retailer_config_file = r"D:\your_path\retailer_config.csv"
+current_retailer     = "Walmart"
+input_file           = r"D:\your_path\walmart_fixed.txt"   # .txt fixed-width OR .csv/.txt delimited
+lookup_file          = r"D:\your_path\lookup_input.csv"    # single column with header: UPC
+output_path          = r"D:\your_path\output"
+
+# -------------------------------------------------------------------------
+# 3. SPARK SESSION INIT – optimized for parallel processing
+# -------------------------------------------------------------------------
+spark = SparkSession.builder.appName("Retailer Data Extractor").getOrCreate()#starts building new spark session, and name is given to display in spark UI(Get or create is to create new session if it is already not there)
+
+# -------------------------------------------------------------------------
+# 4. LOAD CONFIG FOR RETAILER – dynamic mapping from CSV
+# -------------------------------------------------------------------------
+config_df  = pd.read_csv(retailer_config_file)
+config_row = config_df[config_df["Retailer"] == current_retailer].iloc[0]  # Series (single row)#it will be consider as series since we use iloc[0], if it is iloc[[0]]then it is dataframe
+file_type  = config_row["Format_Type"].strip().lower() # 'fixed' or 'delimited'##strip is used to remove spaces
+
+# -------------------------------------------------------------------------
+# 5. LOAD LOOKUP FILE – UPC only: clean, listify, broadcast
+# -------------------------------------------------------------------------
+lookup_pd = pd.read_csv(lookup_file, dtype=str)          # keep UPCs as strings (preserve leading zeros)
+lookup_pd["UPC"] = lookup_pd["UPC"].str.strip()
+lookup_values = lookup_pd["UPC"].dropna().tolist()
+broadcast_lookup = spark.sparkContext.broadcast(lookup_values)
+#broadcast_lookup = spark.sparkContext.broadcast(lookup_values) means I’m sending my 
+#UPC list once from the Driver to all Worker nodes, so each Worker has its own local copy. 
+#When filtering 10 GB of data, this avoids Spark resending the same list repeatedly. 
+#It reduces network overhead and makes filtering by UPC much faster.With broadcast:Driver sends the UPC list once.Workers cache the list locally in their executors’ memory.Any task running on that Worker can instantly access the UPC list, without repeated Driver communication.
+
+# -------------------------------------------------------------------------
+# 6. UTILITY FUNCTIONS
+# -------------------------------------------------------------------------
+def parse_range(pos_str):
+    """Convert '1-12' into (0, 12) for substring slicing (fixed-width)."""
+    start, end = map(int, pos_str.split("-"))#(it converts a range like "1-12" from config into Python-friendly slice indices (0,12)).
+    return start - 1, end
+
+def excel_col_to_index(col):
+    """Convert Excel-style column like 'D' to 0-based index (A->0, B->1, ..., AA->26)."""
+    col = str(col).upper().strip()
+    return ord(col) - ord('A')# ASCII FOR A IS 65 AND B IS 66 SO ANY LETTER MINUS A ASCII GIVES THE INDEX OF THAT ALPHABET
+
+# -------------------------------------------------------------------------
+# 7. FILE PARSING – based on fixed-width or delimited
+# -------------------------------------------------------------------------
+if file_type == "fixed":
+    # Character positions (1-based in config → 0-based here)
+    upc_start,     upc_end     = parse_range(config_row["UPC_Pos"])
+    units_start,   units_end   = parse_range(config_row["Units_Pos"])
+    dollars_start, dollars_end = parse_range(config_row["Dollars_Pos"])
+
+    # Read as lines and slice fields
+    rdd = spark.sparkContext.textFile(input_file)
+    #Spark’s CSV reader can’t directly split fixed-width columns.
+     #So you load lines as raw text (RDD).Then you map a function (parse_line) that slices fields into UPC, Units, Dollars.
+     #Finally, you convert it into a DataFrame.
+
+    def parse_line(line):
+        return (
+            line[upc_start:upc_end].strip(),
+            line[units_start:units_end].strip(),
+            line[dollars_start:dollars_end].strip()
+        )
+
+    df = rdd.map(parse_line).toDF(["UPC", "Units", "Dollars"])
+
+else:
+    # Convert Excel letters to indices
+    upc_idx     = excel_col_to_index(config_row["UPC_Pos"])
+    units_idx   = excel_col_to_index(config_row["Units_Pos"])
+    dollars_idx = excel_col_to_index(config_row["Dollars_Pos"])
+
+    delimiter = "," if input_file.lower().endswith(".csv") else "|"
+    raw_df = spark.read.option("header", True).option("delimiter", delimiter).csv(input_file)
+    cols = raw_df.columns
+
+    df = raw_df.selectExpr(
+        f"`{cols[upc_idx]}` as UPC",
+        f"`{cols[units_idx]}` as Units",
+        f"`{cols[dollars_idx]}` as Dollars"
+    )
+
+# -------------------------------------------------------------------------
+# 8. FILTERING LOGIC – exact match for UPC
+# -------------------------------------------------------------------------
+df = df.fillna({"UPC": ""})
+filtered_df = df.filter(col("UPC").isin(broadcast_lookup.value))
+
+# -------------------------------------------------------------------------
+pdf = filtered_df.toPandas()   # convert Spark DataFrame → pandas DataFrame
+
+# -------------------------------------------------------------------------
+# 10. END SPARK SESSION
+# -------------------------------------------------------------------------
+spark.stop()
