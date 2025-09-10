@@ -1,0 +1,73 @@
+import pandas as pd                 # Import pandas for reading Excel and working with dataframes
+import oracledb                    # Import oracledb to connect to Oracle SQL database
+import smtplib                     # Import smtplib to send emails
+from email.mime.text import MIMEText  # Import MIMEText to format email body
+
+sales = pd.read_excel("Current_Week_Stores.xlsx")         # Load current week sales data (Store_Number, Period, Current_Week_Sales)
+retailers = pd.read_excel("Retailer_Info.xlsx")           # Load retailer info (Store_Number, Retailer_Name, Retailer_Email)
+period_map = pd.read_excel("Period_Week_Map.xlsx")        # Load mapping of Period to human-readable Week name
+
+sales = sales.merge(period_map, on="Period", how="left")  # Add Week name to sales data by merging with period_map
+
+conn = oracledb.connect(user="user", password="pwd", dsn="dsn")  # Connect to Oracle database
+cursor = conn.cursor()                                    # Create a cursor object to execute queries
+
+results = []                                               # Initialize a list to store validation results
+
+for _, row in sales.iterrows():                            # Loop through each row (store) in the sales dataframe
+    store = row['Store_Number']                            # Get store number
+    period = int(row['Period'])                            # Get current period number
+    current = row['Current_Week_Sales']                    # Get current week’s sales value
+    week = row['Week']                                     # Get readable week name (e.g., "June Week 2")
+
+    p7 = [str(period - i) for i in range(1, 8)]            # Create list of last 7 periods (previous 7 weeks)
+    p1y = str(period - 52)                                 # Calculate 1-year ago period
+    p2y = str(period - 104)                                # Calculate 2-year ago period
+    all_p = p7 + [p1y, p2y]                                # Combine all required periods into one list
+
+    query = f"SELECT period, sales_qty FROM rawdata WHERE store_number=:s AND period IN ({','.join(all_p)})"  # Build SQL query to fetch sales for all periods
+    cursor.execute(query, {'s': store})                    # Execute SQL query with store number as parameter
+    df = pd.DataFrame(cursor.fetchall(), columns=['Period', 'Sales_Qty'])  # Convert query result to DataFrame
+
+    if df.empty or df['Period'].isin(p7).sum() < 7:        # If no data or less than 7 past weeks available
+        results.append((store, period, current, "NOT OK", "Insufficient Data"))  # Mark as NOT OK due to insufficient data
+        continue                                           # Move to next store
+
+    avg7 = df[df['Period'].isin(p7)]['Sales_Qty'].mean()   # Calculate average sales of last 7 weeks
+
+    if abs(current - avg7) / avg7 <= 0.10:                 # If current sales is within ±10% of 7-week average
+        results.append((store, period, current, "OK", "7-week match"))  # Mark as OK based on 7-week match
+        continue                                           # Move to next store
+
+    if not df[df['Period'] == p1y].empty:                  # If 1-year ago data is available
+        yval = df[df['Period'] == p1y].iloc[0]['Sales_Qty']  # Get 1-year ago sales value
+        if abs(current - yval) / yval <= 0.10:             # If within ±10% of 1-year ago sales
+            results.append((store, period, current, "OK", "1-year match"))  # Mark as OK based on 1-year match
+            continue                                       # Move to next store
+
+    if not df[df['Period'] == p2y].empty:                  # If 2-year ago data is available
+        y2val = df[df['Period'] == p2y].iloc[0]['Sales_Qty']  # Get 2-year ago sales value
+        if abs(current - y2val) / y2val <= 0.10:           # If within ±10% of 2-year ago sales
+            results.append((store, period, current, "OK", "2-year match"))  # Mark as OK based on 2-year match
+            continue                                       # Move to next store
+
+    info = retailers[retailers['Store_Number'] == store].iloc[0]  # Get retailer email and name using store number
+    retailer_email = info['Retailer_Email']               # Extract email ID of the retailer
+    retailer_name = info['Retailer_Name']                 # Extract name of the retailer
+
+    msg = MIMEText(f"Dear {retailer_name},\n\nSales for Store {store} in Week {week} (Period {period}) is {current}, which is abnormal.\nPlease confirm.")  # Create email body
+    msg['Subject'] = f"Alert – Store {store} – Week {week}"  # Set email subject
+    msg['From'] = "fova@nielseniq.com"                    # Set sender email
+    msg['To'] = retailer_email                            # Set recipient email
+
+    with smtplib.SMTP('smtp.yourdomain.com') as server:   # Connect to SMTP server to send email
+        server.send_message(msg)                          # Send the email to the retailer
+
+    results.append((store, period, current, "NOT OK", "No match – Mail sent"))  # Mark as NOT OK and note that email was sent
+
+pd.DataFrame(results, columns=[
+    'Store_Number', 'Period', 'Current_Week_Sales', 'FOVA_Status', 'Reason'
+]).to_excel("FOVA_Results.xlsx", index=False)             # Save all results to Excel output file
+
+cursor.close()                                            # Close database cursor
+conn.close()                                              # Close Oracle database connection
